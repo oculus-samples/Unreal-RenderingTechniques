@@ -1,0 +1,508 @@
+From f0507798cae8367f8ce6dd6f904bd69d053f1c33 Mon Sep 17 00:00:00 2001
+Date: Mon, 17 Feb 2020 15:07:08 +1300
+Subject: [PATCH] Add support for color grading LUTs via a base pass
+ modification to UE4 mobile
+
+---
+ .../Private/MobileBasePassPixelShader.usf     | 49 +++++++++++++-
+ .../Private/DebugViewModeRendering.cpp        |  2 +-
+ .../Private/EditorPrimitivesRendering.cpp     |  3 +-
+ .../Renderer/Private/MobileBasePass.cpp       | 66 ++++++++++++++-----
+ .../Private/MobileBasePassRendering.cpp       | 12 ++--
+ .../Private/MobileBasePassRendering.h         | 13 +++-
+ .../Private/MobileShadingRenderer.cpp         | 27 ++++++++
+ .../Runtime/Renderer/Private/ScenePrivate.h   |  1 +
+ .../Renderer/Private/SceneRendering.cpp       |  5 ++
+ .../Runtime/Renderer/Private/SceneRendering.h |  2 +
+ 10 files changed, 154 insertions(+), 26 deletions(-)
+
+diff --git a/Engine/Shaders/Private/MobileBasePassPixelShader.usf b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+index 33864b3caa0..7469a68255f 100644
+--- a/Engine/Shaders/Private/MobileBasePassPixelShader.usf
++++ b/Engine/Shaders/Private/MobileBasePassPixelShader.usf
+@@ -9,6 +9,7 @@
+ // Reroute MobileSceneTextures uniform buffer references to the base pass uniform buffer
+ #define MobileSceneTextures MobileBasePass.SceneTextures
+ 
++#include "GammaCorrectionCommon.ush"
+ #include "SHCommon.ush"
+ #include "MobileBasePassCommon.ush"
+ #include "/Engine/Generated/Material.ush"
+@@ -57,6 +58,10 @@ float4 SpotLightDirectionAndSpecularScale[MAX_DYNAMIC_POINT_LIGHTS];
+ #define MOBILE_QL_DISABLE_MATERIAL_NORMAL 0
+ #endif
+ 
++#ifndef ENABLE_COLOR_GRADING
++#define ENABLE_COLOR_GRADING 0
++#endif
++
+ #ifndef MOBILE_CSM_QUALITY
+ #define MOBILE_CSM_QUALITY 2
+ #endif
+@@ -375,6 +380,38 @@ void ApplyPixelDepthOffsetForMobileBasePass(inout FMaterialPixelParameters Mater
+     float PixelDepthOffset = ApplyPixelDepthOffsetToMaterialParameters(MaterialParameters, PixelMaterialInputs, OutDepth);
+ }
+ 
++// LUT for color grading
++Texture2D       ColorGradingLUT;
++SamplerState        ColorGradingLUTSampler;
++
++static const float LUTSize = 32;
++
++half4 UnwrappedTexture3DSample( Texture2D Texture, SamplerState Sampler, float3 UVW, float Size )
++{
++	// a volume texture 16x16x16 would be unwrapped to a 2d texture 256x16
++
++	float IntW = floor( UVW.z * Size - 0.5 );
++	half FracW = UVW.z * Size - 0.5 - IntW;
++
++	float U = ( UVW.x + IntW ) / Size;
++	float V = UVW.y;
++
++	half4 RG0 = Texture2DSample( Texture, Sampler, float2(U, V) );
++	half4 RG1 = Texture2DSample( Texture, Sampler, float2(U + 1.0f / Size, V) );
++
++	return lerp(RG0, RG1, FracW);
++}
++
++half3 ColorLookupTable( half3 LinearColor )
++{
++	float3 LUTEncodedColor = LinToLog( LinearColor + LogToLin( 0 ) );
++	float3 UVW = LUTEncodedColor * ((LUTSize - 1) / LUTSize) + (0.5f / LUTSize);
++
++	half3 OutDeviceColor = UnwrappedTexture3DSample( ColorGradingLUT, ColorGradingLUTSampler, UVW, LUTSize ).rgb;
++	
++	return OutDeviceColor * 1.05;
++}
++
+ void Main( 
+ 	FVertexFactoryInterpolantsVSToPS Interpolants
+ 	, FMobileBasePassInterpolantsVSToPS BasePassInterpolants
+@@ -788,6 +825,15 @@ void Main(
+ 		// Sky materials can result in high luminance values, e.g. the sun disk. So we make sure to at least stay within the boundaries of fp10 for some platforms.
+ 		OutColor.rgb = min(OutColor.rgb, Max10BitsFloat.xxx);
+ 	#endif
++	
++
++	#if ENABLE_COLOR_GRADING
++		OutColor.rgb = ColorLookupTable(OutColor.rgb);
++
++		#if !OUTPUT_GAMMA_SPACE
++			OutColor.rgb = sRGBToLinear(OutColor.rgb); // LUT output is sRGB, so convert back to linear.
++		#endif
++	#endif
+ 
+ #if USE_EDITOR_COMPOSITING && (MOBILE_EMULATION)
+ 	// Editor primitive depth testing
+@@ -810,7 +856,8 @@ void Main(
+ 			OutColor = half4(HdrMosaic(OutColor.rgb,  SvPosition.xy), OutColor.a);
+ 		}
+ 	#endif
+-	#if OUTPUT_GAMMA_SPACE
++
++	#if OUTPUT_GAMMA_SPACE && !ENABLE_COLOR_GRADING
+ 		OutColor.rgb = sqrt(OutColor.rgb);
+ 	#endif
+ #endif
+diff --git a/Engine/Source/Runtime/Renderer/Private/DebugViewModeRendering.cpp b/Engine/Source/Runtime/Renderer/Private/DebugViewModeRendering.cpp
+index 103de30d194..f2adcca9fa2 100644
+--- a/Engine/Source/Runtime/Renderer/Private/DebugViewModeRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/DebugViewModeRendering.cpp
+@@ -279,7 +279,7 @@ void FDebugViewModeMeshProcessor::UpdateInstructionCount(FDebugViewModeShaderEle
+ 			TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>* MobileVS = nullptr;
+ 			TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>* MobilePS = nullptr;
+ 
+-			MobileBasePass::GetShaders(LMP_NO_LIGHTMAP, 0, *InBatchMaterial, InVertexFactoryType, false, MobileVS, MobilePS);
++			MobileBasePass::GetShaders(LMP_NO_LIGHTMAP, 0, *InBatchMaterial, InVertexFactoryType, false, false, MobileVS, MobilePS);
+ 
+ 			OutShaderElementData.NumVSInstructions = MobileVS ? MobileVS->GetNumInstructions() : 0;
+ 			OutShaderElementData.NumPSInstructions = MobilePS ? MobilePS->GetNumInstructions() : 0;
+diff --git a/Engine/Source/Runtime/Renderer/Private/EditorPrimitivesRendering.cpp b/Engine/Source/Runtime/Renderer/Private/EditorPrimitivesRendering.cpp
+index 97c26002e58..e4aff50a789 100644
+--- a/Engine/Source/Runtime/Renderer/Private/EditorPrimitivesRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/EditorPrimitivesRendering.cpp
+@@ -123,7 +123,8 @@ void FEditorPrimitivesBasePassMeshProcessor::ProcessMobileShadingPath(const FMes
+ 		NoLightmapPolicy.GetIndirectPolicy(), 
+ 		NumMovablePointLights,
+ 		Material, 
+-		VertexFactory->GetType(), 
++		VertexFactory->GetType(),
++		Scene->ColorGradingLUTTexture != nullptr,
+ 		bEnableSkyLight, 
+ 		BasePassShaders.VertexShader, 
+ 		BasePassShaders.PixelShader);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePass.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePass.cpp
+index 4d7a5df931c..994d1d1902e 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePass.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePass.cpp
+@@ -17,6 +17,7 @@ template <ELightMapPolicyType Policy, int32 NumMovablePointLights>
+ void GetUniformMobileBasePassShaders(
+ 	const FMaterial& Material, 
+ 	FVertexFactoryType* VertexFactoryType, 
++	bool bEnableColorGrading,
+ 	bool bEnableSkyLight,
+ 	TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>*& VertexShader,
+ 	TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*& PixelShader
+@@ -28,25 +29,39 @@ void GetUniformMobileBasePassShaders(
+ 
+ 		if (bEnableSkyLight)
+ 		{
+-			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, HDR_LINEAR_64, true, NumMovablePointLights> >(VertexFactoryType);
++			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, HDR_LINEAR_64, false, true, NumMovablePointLights> >(VertexFactoryType);
+ 		}
+ 		else
+ 		{
+-			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, HDR_LINEAR_64, false, NumMovablePointLights> >(VertexFactoryType);
++			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, HDR_LINEAR_64, false, false, NumMovablePointLights> >(VertexFactoryType);
+ 		}	
+ 	}
+ 	else
+ 	{
+ 		VertexShader = (TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader<TMobileBasePassVS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32> >(VertexFactoryType);
+ 
+-		if (bEnableSkyLight)
++		if (bEnableColorGrading)
+ 		{
+-			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, true, NumMovablePointLights> >(VertexFactoryType);
++			if (bEnableSkyLight)
++			{
++				PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, true, true, NumMovablePointLights> >(VertexFactoryType);
++			}
++			else
++			{
++				PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, true, false, NumMovablePointLights> >(VertexFactoryType);
++			}
+ 		}
+ 		else
+ 		{
+-			PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, false, NumMovablePointLights> >(VertexFactoryType);
+-		}			
++			if (bEnableSkyLight)
++			{
++				PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, false, true, NumMovablePointLights> >(VertexFactoryType);
++			}
++			else
++			{
++				PixelShader = (TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*)Material.GetShader< TMobileBasePassPS<TUniformLightMapPolicy<Policy>, LDR_GAMMA_32, false, false, NumMovablePointLights> >(VertexFactoryType);
++			}
++		}		
+ 	}
+ }
+ 
+@@ -55,6 +70,7 @@ void GetMobileBasePassShaders(
+ 	ELightMapPolicyType LightMapPolicyType, 
+ 	const FMaterial& Material, 
+ 	FVertexFactoryType* VertexFactoryType, 
++	bool bEnableColorGrading,
+ 	bool bEnableSkyLight,
+ 	TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>*& VertexShader,
+ 	TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*& PixelShader
+@@ -63,37 +79,37 @@ void GetMobileBasePassShaders(
+ 	switch (LightMapPolicyType)
+ 	{
+ 	case LMP_LQ_LIGHTMAP:
+-		GetUniformMobileBasePassShaders<LMP_LQ_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_LQ_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_DISTANCE_FIELD_SHADOWS_AND_LQ_LIGHTMAP:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_DISTANCE_FIELD_SHADOWS_AND_LQ_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_DISTANCE_FIELD_SHADOWS_AND_LQ_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_DISTANCE_FIELD_SHADOWS_LIGHTMAP_AND_CSM:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_DISTANCE_FIELD_SHADOWS_LIGHTMAP_AND_CSM, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_DISTANCE_FIELD_SHADOWS_LIGHTMAP_AND_CSM, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_DIRECTIONAL_LIGHT_CSM_AND_SH_INDIRECT, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_WITH_LIGHTMAP:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_WITH_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_WITH_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_WITH_LIGHTMAP:
+-		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_WITH_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_MOBILE_MOVABLE_DIRECTIONAL_LIGHT_CSM_WITH_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	case LMP_NO_LIGHTMAP:
+-		GetUniformMobileBasePassShaders<LMP_NO_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableSkyLight, VertexShader, PixelShader);
++		GetUniformMobileBasePassShaders<LMP_NO_LIGHTMAP, NumMovablePointLights>(Material, VertexFactoryType, bEnableColorGrading, bEnableSkyLight, VertexShader, PixelShader);
+ 		break;
+ 	default:										
+ 		check(false);
+@@ -105,6 +121,7 @@ void MobileBasePass::GetShaders(
+ 	int32 NumMovablePointLights, 
+ 	const FMaterial& MaterialResource,
+ 	FVertexFactoryType* VertexFactoryType,
++	bool bEnableColorGrading,
+ 	bool bEnableSkyLight, 
+ 	TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>*& VertexShader,
+ 	TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*& PixelShader)
+@@ -122,6 +139,7 @@ void MobileBasePass::GetShaders(
+ 			LightMapPolicyType,
+ 			MaterialResource,
+ 			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight,
+ 			VertexShader,
+ 			PixelShader
+@@ -131,7 +149,8 @@ void MobileBasePass::GetShaders(
+ 		GetMobileBasePassShaders<1>(
+ 			LightMapPolicyType, 
+ 			MaterialResource, 
+-			VertexFactoryType, 
++			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight, 
+ 			VertexShader,
+ 			PixelShader
+@@ -142,6 +161,7 @@ void MobileBasePass::GetShaders(
+ 			LightMapPolicyType,
+ 			MaterialResource,
+ 			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight,
+ 			VertexShader,
+ 			PixelShader
+@@ -152,6 +172,7 @@ void MobileBasePass::GetShaders(
+ 			LightMapPolicyType,
+ 			MaterialResource,
+ 			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight,
+ 			VertexShader,
+ 			PixelShader
+@@ -162,6 +183,7 @@ void MobileBasePass::GetShaders(
+ 			LightMapPolicyType,
+ 			MaterialResource,
+ 			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight,
+ 			VertexShader,
+ 			PixelShader
+@@ -173,6 +195,7 @@ void MobileBasePass::GetShaders(
+ 			LightMapPolicyType,
+ 			MaterialResource,
+ 			VertexFactoryType,
++			bEnableColorGrading,
+ 			bEnableSkyLight,
+ 			VertexShader,
+ 			PixelShader
+@@ -454,6 +477,12 @@ void TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>::GetShaderBindings
+ 
+ 	if (Scene)
+ 	{
++		if (Scene->ColorGradingLUTTexture && ColorGradingLUT.IsBound())
++		{
++			FSamplerStateRHIRef ColorGradingLUTSamplerState = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
++			ShaderBindings.AddTexture(ColorGradingLUT, ColorGradingLUTSampler, ColorGradingLUTSamplerState, Scene->ColorGradingLUTTexture);
++		}
++
+ 		// test for HQ reflection parameter existence
+ 		if (HQReflectionCubemaps[0].IsBound() || HQReflectionCubemaps[1].IsBound() || HQReflectionCubemaps[2].IsBound())
+ 		{
+@@ -626,6 +655,7 @@ void FMobileBasePassMeshProcessor::Process(
+ 		NumMovablePointLights, 
+ 		MaterialResource, 
+ 		MeshBatch.VertexFactory->GetType(), 
++		Scene->ColorGradingLUTTexture != nullptr,
+ 		bEnableSkyLight, 
+ 		BasePassShaders.VertexShader, 
+ 		BasePassShaders.PixelShader);
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+index 1f3f59918fd..851950238b3 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.cpp
+@@ -54,13 +54,17 @@ static TAutoConsoleVariable<int32> CVarMobileUseHWsRGBEncoding(
+ 	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassVS##LightMapPolicyName##HDRLinear64, TEXT("/Engine/Private/MobileBasePassVertexShader.usf"), TEXT("Main"), SF_Vertex);
+ 
+ #define IMPLEMENT_MOBILE_SHADING_BASEPASS_LIGHTMAPPED_PIXEL_SHADER_TYPE(LightMapPolicyType,LightMapPolicyName,NumMovablePointLights) \
+-	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, false, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32; \
+-	typedef TMobileBasePassPS< LightMapPolicyType, HDR_LINEAR_64, false, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64; \
+-	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, true, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32##Skylight; \
+-	typedef TMobileBasePassPS< LightMapPolicyType, HDR_LINEAR_64, true, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64##Skylight; \
++	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, false, false, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32; \
++	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, true, false, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32ColorGrading; \
++	typedef TMobileBasePassPS< LightMapPolicyType, HDR_LINEAR_64, false, false, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64; \
++	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, false, true, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32##Skylight; \
++	typedef TMobileBasePassPS< LightMapPolicyType, LDR_GAMMA_32, true, true, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32##SkylightColorGrading; \
++	typedef TMobileBasePassPS< LightMapPolicyType, HDR_LINEAR_64, false, true, NumMovablePointLights > TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64##Skylight; \
+ 	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel); \
++	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32ColorGrading, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel); \
+ 	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel); \
+ 	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32##Skylight, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel); \
++	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##LDRGamma32##SkylightColorGrading, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel); \
+ 	IMPLEMENT_MATERIAL_SHADER_TYPE(template<>, TMobileBasePassPS##LightMapPolicyName##NumMovablePointLights##HDRLinear64##Skylight, TEXT("/Engine/Private/MobileBasePassPixelShader.usf"), TEXT("Main"), SF_Pixel);
+ 
+ static_assert(MAX_BASEPASS_DYNAMIC_POINT_LIGHTS == 4, "If you change MAX_BASEPASS_DYNAMIC_POINT_LIGHTS, you need to add shader types below");
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+index 8559d46bce1..fa8c5df1b56 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/MobileBasePassRendering.h
+@@ -239,6 +239,9 @@ public:
+ 		MobileDirectionLightBufferParam.Bind(Initializer.ParameterMap, FMobileDirectionalLightShaderParameters::StaticStructMetadata.GetShaderVariableName());
+ 		ReflectionParameter.Bind(Initializer.ParameterMap, FMobileReflectionCaptureShaderParameters::StaticStructMetadata.GetShaderVariableName());
+ 
++		ColorGradingLUT.Bind(Initializer.ParameterMap, TEXT("ColorGradingLUT"));
++		ColorGradingLUTSampler.Bind(Initializer.ParameterMap, TEXT("ColorGradingLUTSampler"));
++
+ 		HQReflectionCubemaps[0].Bind(Initializer.ParameterMap, TEXT("ReflectionCubemap0"));
+ 		HQReflectionSamplers[0].Bind(Initializer.ParameterMap, TEXT("ReflectionCubemapSampler0"));
+ 		HQReflectionCubemaps[1].Bind(Initializer.ParameterMap, TEXT("ReflectionCubemap1"));
+@@ -267,6 +270,9 @@ public:
+ 		Ar << MobileDirectionLightBufferParam;
+ 		Ar << ReflectionParameter;
+ 
++		Ar << ColorGradingLUT;
++		Ar << ColorGradingLUTSampler;
++
+ 		Ar << HQReflectionCubemaps[0];
+ 		Ar << HQReflectionCubemaps[1];
+ 		Ar << HQReflectionCubemaps[2];
+@@ -291,6 +297,9 @@ private:
+ 	FShaderUniformBufferParameter MobileDirectionLightBufferParam;
+ 	FShaderUniformBufferParameter ReflectionParameter;
+ 
++	FShaderResourceParameter ColorGradingLUT;
++	FShaderResourceParameter ColorGradingLUTSampler;
++
+ 	// HQ reflection bound as loose params
+ 	FShaderResourceParameter HQReflectionCubemaps[3];
+ 	FShaderResourceParameter HQReflectionSamplers[3];
+@@ -361,6 +370,7 @@ namespace MobileBasePass
+ 		int32 NumMovablePointLights, 
+ 		const FMaterial& MaterialResource,
+ 		FVertexFactoryType* VertexFactoryType,
++		bool bEnableColorGrading,
+ 		bool bEnableSkyLight, 
+ 		TMobileBasePassVSPolicyParamType<FUniformLightMapPolicy>*& VertexShader,
+ 		TMobileBasePassPSPolicyParamType<FUniformLightMapPolicy>*& PixelShader);
+@@ -387,7 +397,7 @@ inline bool UseSkylightPermutation(bool bEnableSkyLight, int32 MobileSkyLightPer
+ 	}
+ }
+ 
+-template< typename LightMapPolicyType, EOutputFormat OutputFormat, bool bEnableSkyLight, int32 NumMovablePointLights>
++template< typename LightMapPolicyType, EOutputFormat OutputFormat, bool bEnableColorGrading, bool bEnableSkyLight, int32 NumMovablePointLights>
+ class TMobileBasePassPS : public TMobileBasePassPSBaseType<LightMapPolicyType>
+ {
+ 	DECLARE_SHADER_TYPE(TMobileBasePassPS,MeshMaterial);
+@@ -428,6 +438,7 @@ public:
+ 
+ 		TMobileBasePassPSBaseType<LightMapPolicyType>::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+ 		OutEnvironment.SetDefine(TEXT("ENABLE_SKY_LIGHT"), bEnableSkyLight);
++		OutEnvironment.SetDefine(TEXT("ENABLE_COLOR_GRADING"), bEnableColorGrading);
+ 		OutEnvironment.SetDefine(TEXT("OUTPUT_GAMMA_SPACE"), OutputFormat == LDR_GAMMA_32 && !bMobileUseHWsRGBEncoding);
+ 		OutEnvironment.SetDefine(TEXT("OUTPUT_MOBILE_HDR"), OutputFormat == HDR_LINEAR_64 ? 1u : 0u);
+ 		if (NumMovablePointLights == INT32_MAX)
+diff --git a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+index ef1b2fa3981..6c8b74be35f 100644
+--- a/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp
+@@ -29,6 +29,7 @@
+ #include "PostProcess/RenderingCompositionGraph.h"
+ #include "PostProcess/PostProcessing.h"
+ #include "PostProcess/PostProcessMobile.h"
++#include "PostProcess/PostProcessCombineLUTs.h"
+ #include "PostProcess/PostProcessUpscale.h"
+ #include "PostProcess/PostProcessCompositeEditorPrimitives.h"
+ #include "PostProcess/PostProcessHMD.h"
+@@ -310,6 +311,7 @@ void FMobileSceneRenderer::InitViews(FRHICommandListImmediate& RHICmdList)
+ 		const FViewInfo& View = Views[0];
+ 		// We want to wait for the extension jobs only when the view is being actually rendered for the first time
+ 		Scene->UniformBuffers.UpdateViewUniformBuffer(View, false);
++
+ 		UpdateOpaqueBasePassUniformBuffer(RHICmdList, View);
+ 		UpdateTranslucentBasePassUniformBuffer(RHICmdList, View);
+ 		UpdateDirectionalLightUniformBuffers(RHICmdList, View);
+@@ -372,6 +374,31 @@ void FMobileSceneRenderer::EndLateLatching(FRHICommandListImmediate& RHICmdList,
+ */
+ void FMobileSceneRenderer::Render(FRHICommandListImmediate& RHICmdList)
+ {
++	bool bShouldApplyColorGrading = Views[0].ViewState && 
++		Views[0].Family->ViewMode == VMI_Lit &&
++		Views[0].bIsGameView && !Views[0].bIsSceneCapture && !Views[0].bIsReflectionCapture && !Views[0].bIsPlanarReflection;
++
++	if (bShouldApplyColorGrading)
++	{
++		if (!Views[0].GetTonemappingLUT())
++		{
++			// Rather than regenerating the LUT every frame on mobile, we assume that it is constant to save GPU processing.
++			FRDGBuilder GraphBuilder(RHICmdList);
++			AddCombineLUTPass(GraphBuilder, Views[0]);
++			GraphBuilder.Execute();
++		}
++
++		Scene->ColorGradingLUTTexture = Views[0].GetTonemappingLUTTexture();
++		check(Scene->ColorGradingLUTTexture);
++
++		FRHITexture* Texture = Scene->ColorGradingLUTTexture;
++		RHICmdList.TransitionResources(EResourceTransitionAccess::EReadable, &Texture, 1);
++	}
++	else
++	{
++		Scene->ColorGradingLUTTexture = nullptr;
++	}
++
+ 	RHICmdList.SetCurrentStat(GET_STATID(STAT_CLMM_SceneStart));
+ 
+ 	SCOPED_DRAW_EVENT(RHICmdList, MobileSceneRender);
+diff --git a/Engine/Source/Runtime/Renderer/Private/ScenePrivate.h b/Engine/Source/Runtime/Renderer/Private/ScenePrivate.h
+index 8aa1c7e840b..fa25f1e2c1d 100644
+--- a/Engine/Source/Runtime/Renderer/Private/ScenePrivate.h
++++ b/Engine/Source/Runtime/Renderer/Private/ScenePrivate.h
+@@ -2440,6 +2440,7 @@ public:
+ 	class FFXSystemInterface* FXSystem;
+ 
+ 	FPersistentUniformBuffers UniformBuffers;
++	FTextureRHIRef ColorGradingLUTTexture;
+ 
+ 	/** Instancing state buckets.  These are stored on the scene as they are precomputed at FPrimitiveSceneInfo::AddToScene time. */
+ 	TSet<FMeshDrawCommandStateBucket, MeshDrawCommandKeyFuncs> CachedMeshDrawCommandStateBuckets;
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp b/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
+index 5f7546d78e0..43c1b66b2f9 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.cpp
+@@ -2014,6 +2014,11 @@ IPooledRenderTarget* FViewInfo::GetTonemappingLUT(FRHICommandList& RHICmdList, c
+ 	return nullptr;
+ }
+ 
++FTextureRHIRef FViewInfo::GetTonemappingLUTTexture() const
++{
++	return GetTonemappingLUT()->GetRenderTargetItem().TargetableTexture;
++}
++
+ void FViewInfo::SetCustomData(const FPrimitiveSceneInfo* InPrimitiveSceneInfo, void* InCustomData)
+ {
+ 	check(InPrimitiveSceneInfo != nullptr);
+diff --git a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+index c84c8960d93..0da2f70f365 100644
+--- a/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
++++ b/Engine/Source/Runtime/Renderer/Private/SceneRendering.h
+@@ -1266,6 +1266,8 @@ public:
+ 	/** Informs sceneinfo that tonemapping LUT has queued commands to compute it at least once */
+ 	void SetValidTonemappingLUT() const;
+ 
++	FTextureRHIRef GetTonemappingLUTTexture() const;
++
+ 	/** Gets the tonemapping LUT texture, previously computed by the CombineLUTS post process,
+ 	* for stereo rendering, this will force the post-processing to use the same texture for both eyes*/
+ 	IPooledRenderTarget* GetTonemappingLUT() const;
+-- 
+2.21.0.windows.1
+
