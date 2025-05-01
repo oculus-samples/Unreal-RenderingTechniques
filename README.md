@@ -70,21 +70,9 @@ Then, clone this repo using the "Code" button above, or this command:
 git clone https://github.com/oculus-samples/Unreal-RenderingTechniques
 ```
 
-### Launch the project in the Unreal Editor using one of the following options.
+### Launch the project in the Meta fork of Epic’s Unreal Engine
 
-#### Epic Games Launcher with MetaXR plugin
-
-The easiest way to get started is to use the prebuilt Unreal Engine from the Epic Games Launcher, with MetaXR plugin.
-
-1. Install the [Epic Games Launcher](https://www.epicgames.com/store/en-US/download)
-2. In the launcher, install UE5 (recommended).
-3. Download and install the MetaXR plugin from the [Unreal Engine 5 Integration download page](https://developer.oculus.com/downloads/package/unreal-engine-5-integration).
-4. Launch the Unreal Editor
-5. From "Recent Projects", click "Browse" and select `RenderingTechniques.uproject`
-
-#### Meta fork of Epic’s Unreal Engine
-
-The Meta fork of Epic’s Unreal Engine will give you the most up to date integration of Oculus features. However, you must build the editor from its source.
+This project requires Meta fork of Epic’s Unreal Engine. It will give you the most up to date integration of Meta Quest features. However, you must build the editor from its source.
 
 Follow the instructions on [Accessing Unreal Engine source code on GitHub](https://www.unrealengine.com/en-US/ue-on-github) to obtain:
 - an Epic account
