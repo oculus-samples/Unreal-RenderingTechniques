@@ -1,6 +1,6 @@
 # Rendering Techniques
 
-To change which map is launched, adjust the default map in the project settings, or use the Launch button directly within the editor rather than using the Project Launcher.
+To change which map is launched, adjust the default map in the project settings, or use the Launch button directly within the editor/application to switch maps in play.
 
 ### Cascaded Shadows
 
@@ -13,28 +13,6 @@ Lights must currently be movable for cascaded shadows to work; stationary lights
 ### Color Grading
 
 This map demonstrates how to use look-up tables (LUTs) to adjust the look of your scene.
-
-Color grading requires that the patch in the "ColorGradingLUT UE4 Patch" folder is applied to the UE4 source code. With the patch applied, color grading LUTs can be applied as described in the [UE4 support document on LUTs](https://docs.unrealengine.com/en-US/Engine/Rendering/PostProcessEffects/UsingLUTs/index.html).
-
-Note that by default the patch computes the LUT only once rather than rebuilding it every frame. If you have changing or animated postprocessing conditions, this can be changed by adjusting:
-
-```
-if (!Views[0].GetTonemappingLUT())
-{
-    // Rather than regenerating the LUT every frame on mobile, we assume that it is constant to save GPU processing.
-    FRDGBuilder GraphBuilder(RHICmdList);
-    AddCombineLUTPass(GraphBuilder, Views[0]);
-    GraphBuilder.Execute();
-}
-```
-
-to remove the `if` statement; that is:
-
-```
-FRDGBuilder GraphBuilder(RHICmdList);
-AddCombineLUTPass(GraphBuilder, Views[0]);
-GraphBuilder.Execute();
-```
 
 ### Distance Field Baked Shadows
 
@@ -95,4 +73,4 @@ Make sure you have Visual Studio installed properly:
     - Depending on your machine, the build may take awhile to complete.
 
 # Licenses
-The Meta License applies to the SDK and supporting material. The MIT License applies to only certain, clearly marked documents. If an individual file does not indicate which license it is subject to, then the Meta License applies.
+The [Meta License](./LICENSE) applies to the SDK and supporting material. The MIT License applies to only certain, clearly marked documents. If an individual file does not indicate which license it is subject to, then the Meta License applies.
