@@ -14,7 +14,7 @@ public class RenderingTechniquesTarget : TargetRules
     public RenderingTechniquesTarget(TargetInfo Target) : base(Target)
     {
         Type = TargetType.Game;
-        DefaultBuildSettings = BuildSettingsVersion.V4;
+        DefaultBuildSettings = BuildSettingsVersion.Latest;
         IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
 
         ExtraModuleNames.AddRange(new string[] { "RenderingTechniques" });
